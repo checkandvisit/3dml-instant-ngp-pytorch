@@ -1,0 +1,18 @@
+{
+    "name": "Existing Dockerfile",
+    "context": "..",
+    "dockerFile": "Dockerfile",
+    "extensions": [
+        "ms-python.python",
+        "ms-toolsai.jupyter",
+        "seatonjiang.gitmoji-vscode"
+    ],
+    "runArgs": [
+        "--gpus",
+        "all",
+        "--net=host",
+        "--ipc=host",
+        "-v",
+        "${localEnv:HOME}/.aws/credentials:/home/dock/.aws/credentials"
+    ]
+}
