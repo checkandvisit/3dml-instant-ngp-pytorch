@@ -1,12 +1,14 @@
 import argparse
 
+from datasets import dataset_dict
+
 def get_opts():
     parser = argparse.ArgumentParser()
 
     parser.add_argument('--root_dir', type=str, required=True,
                         help='root directory of dataset')
     parser.add_argument('--dataset_name', type=str, default='nsvf',
-                        choices=['nsvf', 'colmap'],
+                        choices=list(dataset_dict.keys()),
                         help='which dataset to train/test')
     parser.add_argument('--split', type=str, default='train',
                         choices=['train', 'trainval'],
@@ -33,6 +35,8 @@ def get_opts():
                         help='run only validation (need to provide ckpt_path)')
     parser.add_argument('--no_save_test', action='store_true', default=False,
                         help='whether to save test image and video')
+    parser.add_argument('--fps', type=float, default=30,
+                        help='fps of output video')
 
     parser.add_argument('--lr', type=float, default=1e-2,
                         help='learning rate')

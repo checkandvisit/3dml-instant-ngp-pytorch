@@ -248,13 +248,11 @@ if __name__ == '__main__':
                       save_poses=hparams.optimize_ext)
         torch.save(ckpt_, f'ckpts/{hparams.exp_name}/epoch={hparams.num_epochs-1}_slim.ckpt')
 
-    if (not hparams.no_save_test) and \
-       hparams.dataset_name=='nsvf' and \
-       'Synthetic' in hparams.root_dir: # save video
+    if not hparams.no_save_test: # save video
         imgs = sorted(glob.glob(os.path.join(system.val_dir, '*.png')))
         imageio.mimsave(os.path.join(system.val_dir, 'rgb.mp4'),
                         [imageio.imread(img) for img in imgs[::2]],
-                        fps=30, macro_block_size=1)
+                        fps=hparams.fps, macro_block_size=1)
         imageio.mimsave(os.path.join(system.val_dir, 'depth.mp4'),
                         [imageio.imread(img) for img in imgs[1::2]],
-                        fps=30, macro_block_size=1)
+                        fps=hparams.fps, macro_block_size=1)
