@@ -9,7 +9,7 @@ from .rendering import NEAR_DISTANCE
 
 
 class NGP(nn.Module):
-    def __init__(self, scale):
+    def __init__(self, scale, rgb_act='Sigmoid'):
         super().__init__()
 
         # scene bounding box
@@ -69,7 +69,7 @@ class NGP(nn.Module):
                 network_config={
                     "otype": "FullyFusedMLP",
                     "activation": "ReLU",
-                    "output_activation": "Sigmoid",
+                    "output_activation": rgb_act,
                     "n_neurons": 64,
                     "n_hidden_layers": 2,
                 }
@@ -103,7 +103,7 @@ class NGP(nn.Module):
             rgbs: (N, 3)
         """
         sigmas, h = self.density(x, return_feat=True)
-        d /= torch.norm(d, dim=-1, keepdim=True)
+        d = d/torch.norm(d, dim=1, keepdim=True)
         d = self.dir_encoder((d+1)/2)
         rgbs = self.rgb_net(torch.cat([d, h], 1))
 
@@ -141,9 +141,10 @@ class NGP(nn.Module):
             indices1 = vren.morton3D(coords1).long()
             # occupied cells
             indices2 = torch.nonzero(self.density_grid[c]>density_threshold)[:, 0]
-            rand_idx = torch.randint(len(indices2), (M,),
-                                     device=self.density_grid.device)
-            indices2 = indices2[rand_idx]
+            if len(indices2)>0:
+                rand_idx = torch.randint(len(indices2), (M,),
+                                         device=self.density_grid.device)
+                indices2 = indices2[rand_idx]
             coords2 = vren.morton3D_invert(indices2.int())
             # concatenate
             cells += [(torch.cat([indices1, indices2]), torch.cat([coords1, coords2]))]

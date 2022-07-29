@@ -11,7 +11,7 @@ from einops import rearrange
 # data
 from torch.utils.data import DataLoader
 from datasets import dataset_dict
-from datasets.ray_utils import get_rays
+from datasets.ray_utils import axisangle_to_R, get_rays
 
 # models
 from kornia.utils.grid import create_meshgrid3d
@@ -61,12 +61,12 @@ class NeRFSystem(LightningModule):
         self.train_psnr = PeakSignalNoiseRatio(data_range=1)
         self.val_psnr = PeakSignalNoiseRatio(data_range=1)
         self.val_ssim = StructuralSimilarityIndexMeasure(data_range=1)
-        if hparams.eval_lpips:
+        if self.hparams.eval_lpips:
             self.val_lpips = LearnedPerceptualImagePatchSimilarity('vgg')
             for p in self.val_lpips.net.parameters():
                 p.requires_grad = False
 
-        self.model = NGP(scale=hparams.scale)
+        self.model = NGP(scale=self.hparams.scale)
         G = self.model.grid_size
         self.model.register_buffer('density_grid',
             torch.zeros(self.model.cascades, G**3))
@@ -75,17 +75,17 @@ class NeRFSystem(LightningModule):
 
     def forward(self, rays_o, rays_d, split):
         kwargs = {'test_time': split!='train'}
-        if hparams.dataset_name == 'colmap':
+        if self.hparams.dataset_name in ['colmap', 'nerfpp']:
             kwargs['exp_step_factor'] = 1/256
 
         return render(self.model, rays_o, rays_d, **kwargs)
 
     def setup(self, stage):
-        dataset = dataset_dict[hparams.dataset_name]
-        kwargs = {'root_dir': hparams.root_dir,
-                  'downsample': hparams.downsample}
-        self.train_dataset = dataset(split=hparams.split, **kwargs)
-        self.train_dataset.batch_size = hparams.batch_size
+        dataset = dataset_dict[self.hparams.dataset_name]
+        kwargs = {'root_dir': self.hparams.root_dir,
+                  'downsample': self.hparams.downsample}
+        self.train_dataset = dataset(split=self.hparams.split, **kwargs)
+        self.train_dataset.batch_size = self.hparams.batch_size
 
         self.test_dataset = dataset(split='test', **kwargs)
 
@@ -94,21 +94,30 @@ class NeRFSystem(LightningModule):
         self.register_buffer('directions', self.train_dataset.directions.to(self.device))
         self.register_buffer('poses', self.train_dataset.poses.to(self.device))
 
-        if hparams.optimize_ext:
+        if self.hparams.optimize_ext:
             N = len(self.train_dataset.poses)
             self.register_parameter('dR',
-                nn.Parameter(torch.zeros(N, 3, dtype=torch.float32, device=self.device)))
+                nn.Parameter(torch.zeros(N, 3, device=self.device)))
             self.register_parameter('dT',
-                nn.Parameter(torch.zeros(N, 3, dtype=torch.float32, device=self.device)))
+                nn.Parameter(torch.zeros(N, 3, device=self.device)))
 
-        # print('params', list(self.named_parameters()))
-        # TODO: use different learning rate for dR and dT
-        self.opt = FusedAdam(self.parameters(), hparams.lr, eps=1e-15)
-        self.sch = CosineAnnealingLR(self.opt,
-                                     hparams.num_epochs,
-                                     hparams.lr/30)
+        net_params = []
+        for n, p in self.named_parameters():
+            if n not in ['dR', 'dT']: net_params += [p]
+        
+        opts = []
+        self.net_opt = FusedAdam(net_params, self.hparams.lr, eps=1e-15)
+        opts += [self.net_opt]
+        if self.hparams.optimize_ext:
+            # learning rate is hard-coded
+            pose_r_opt = FusedAdam([self.dR], 1e-6)
+            pose_t_opt = FusedAdam([self.dT], 1e-6)
+            opts += [pose_r_opt, pose_t_opt]
+        net_sch = CosineAnnealingLR(self.net_opt,
+                                    self.hparams.num_epochs,
+                                    self.hparams.lr/30)
 
-        return [self.opt], [self.sch]
+        return opts, [net_sch]
 
     def train_dataloader(self):
         return DataLoader(self.train_dataset,
@@ -128,21 +137,27 @@ class NeRFSystem(LightningModule):
                                         self.poses,
                                         self.train_dataset.img_wh)
 
-    def training_step(self, batch, batch_nb):
+    def training_step(self, batch, batch_nb, *args):
         if self.global_step%self.S == 0:
             self.model.update_density_grid(0.01*MAX_SAMPLES/3**0.5,
                                            warmup=self.global_step<256,
-                                           erode=hparams.dataset_name!='nsvf')
+                                           erode=self.hparams.dataset_name=='colmap')
 
-        rays_o, rays_d = get_rays(self.directions[batch['pix_idxs']],
-                                  self.poses[batch['img_idxs']])
+        poses = self.poses[batch['img_idxs']] # (B, 3, 4)
+        if self.hparams.optimize_ext:
+            dR = axisangle_to_R(self.dR[batch['img_idxs']]) # (B, 3, 3)
+            poses[..., :3] = dR @ poses[..., :3]
+            dT = self.dT[batch['img_idxs']] # (B, 3)
+            poses[..., 3] += dT
+
+        rays_o, rays_d = get_rays(self.directions[batch['pix_idxs']], poses)
         results = self(rays_o, rays_d, split='train')
         loss_d = self.loss(results, batch)
         loss = sum(lo.mean() for lo in loss_d.values())
 
         with torch.no_grad():
             self.train_psnr(results['rgb'], batch['rgb'])
-        self.log('lr', self.opt.param_groups[0]['lr'])
+        self.log('lr', self.net_opt.param_groups[0]['lr'])
         self.log('train/loss', loss)
         self.log('train/s_per_ray',
                  results['total_samples']/len(rays_o), prog_bar=True)
@@ -152,12 +167,17 @@ class NeRFSystem(LightningModule):
 
     def on_validation_start(self):
         torch.cuda.empty_cache()
-        if not hparams.no_save_test:
-            self.val_dir = f'results/{hparams.dataset_name}/{hparams.exp_name}'
+        if not self.hparams.no_save_test:
+            self.val_dir = f'results/{self.hparams.dataset_name}/{self.hparams.exp_name}'
             os.makedirs(self.val_dir, exist_ok=True)
 
     def validation_step(self, batch, batch_nb):
         rgb_gt = batch['rgb']
+        if self.hparams.optimize_ext:
+            dR = axisangle_to_R(self.dR[batch['img_idxs']]) # (B, 3, 3)
+            batch['pose'][..., :3] = dR @ batch['pose'][..., :3]
+            dT = self.dT[batch['img_idxs']] # (3)
+            batch['pose'][..., 3] += dT
         rays_o, rays_d = get_rays(self.directions, batch['pose'])
         results = self(rays_o, rays_d, split='test')
 
@@ -173,14 +193,14 @@ class NeRFSystem(LightningModule):
         self.val_ssim(rgb_pred, rgb_gt)
         logs['ssim'] = self.val_ssim.compute()
         self.val_ssim.reset()
-        if hparams.eval_lpips:
+        if self.hparams.eval_lpips:
             self.val_lpips(torch.clip(rgb_pred*2-1, -1, 1),
                            torch.clip(rgb_gt*2-1, -1, 1))
             logs['lpips'] = self.val_lpips.compute()
             self.val_lpips.reset()
 
-        if not hparams.no_save_test: # save test image to disk
-            idx = batch['idx']
+        if not self.hparams.no_save_test: # save test image to disk
+            idx = batch['img_idxs']
             rgb_pred = rearrange(results['rgb'].cpu().numpy(), '(h w) c -> h w c', h=h)
             rgb_pred = (rgb_pred*255).astype(np.uint8)
             depth = depth2img(rearrange(results['depth'].cpu().numpy(), '(h w) -> h w', h=h))
@@ -198,7 +218,7 @@ class NeRFSystem(LightningModule):
         mean_ssim = all_gather_ddp_if_available(ssims).mean()
         self.log('test/ssim', mean_ssim)
 
-        if hparams.eval_lpips:
+        if self.hparams.eval_lpips:
             lpipss = torch.stack([x['lpips'] for x in outputs])
             mean_lpips = all_gather_ddp_if_available(lpipss).mean()
             self.log('test/lpips_vgg', mean_lpips)
@@ -216,7 +236,7 @@ if __name__ == '__main__':
         raise ValueError('You need to provide a @ckpt_path for validation!')
     system = NeRFSystem(hparams)
 
-    ckpt_cb = ModelCheckpoint(dirpath=f'ckpts/{hparams.exp_name}',
+    ckpt_cb = ModelCheckpoint(dirpath=f'ckpts/{hparams.dataset_name}/{hparams.exp_name}',
                               filename='{epoch:d}',
                               save_weights_only=True,
                               every_n_epochs=hparams.num_epochs,
@@ -224,7 +244,7 @@ if __name__ == '__main__':
                               save_top_k=-1)
     callbacks = [ckpt_cb, TQDMProgressBar(refresh_rate=1)]
 
-    logger = TensorBoardLogger(save_dir="logs",
+    logger = TensorBoardLogger(save_dir=f"logs/{hparams.dataset_name}",
                                name=hparams.exp_name,
                                default_hp_metric=False)
 
@@ -244,9 +264,9 @@ if __name__ == '__main__':
 
     if not hparams.val_only: # save slimmed ckpt for the last epoch
         ckpt_ = \
-            slim_ckpt(f'ckpts/{hparams.exp_name}/epoch={hparams.num_epochs-1}.ckpt',
+            slim_ckpt(f'ckpts/{hparams.dataset_name}/{hparams.exp_name}/epoch={hparams.num_epochs-1}.ckpt',
                       save_poses=hparams.optimize_ext)
-        torch.save(ckpt_, f'ckpts/{hparams.exp_name}/epoch={hparams.num_epochs-1}_slim.ckpt')
+        torch.save(ckpt_, f'ckpts/{hparams.dataset_name}/{hparams.exp_name}/epoch={hparams.num_epochs-1}_slim.ckpt')
 
     if not hparams.no_save_test: # save video
         imgs = sorted(glob.glob(os.path.join(system.val_dir, '*.png')))

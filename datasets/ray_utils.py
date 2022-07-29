@@ -5,7 +5,7 @@ from einops import rearrange
 
 
 @torch.cuda.amp.autocast(dtype=torch.float32)
-def get_ray_directions(H, W, K, random=False, return_uv=False, flatten=True):
+def get_ray_directions(H, W, K, device='cpu', random=False, return_uv=False, flatten=True):
     """
     Get ray directions for all pixels in camera coordinate [right down front].
     Reference: https://www.scratchapixel.com/lessons/3d-basic-rendering/
@@ -21,7 +21,7 @@ def get_ray_directions(H, W, K, random=False, return_uv=False, flatten=True):
         directions: (H, W, 3) or (H*W, 3), the direction of the rays in camera coordinate
         uv: (H, W, 2) or (H*W, 2) image coordinates
     """
-    grid = create_meshgrid(H, W, False)[0] # (H, W, 2)
+    grid = create_meshgrid(H, W, False, device=device)[0] # (H, W, 2)
     u, v = grid.unbind(-1)
 
     fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
@@ -67,6 +67,31 @@ def get_rays(directions, c2w):
     rays_o = c2w[..., 3].expand_as(rays_d)
 
     return rays_o, rays_d
+
+
+@torch.cuda.amp.autocast(dtype=torch.float32)
+def axisangle_to_R(v):
+    """
+    Convert an axis-angle vector to rotation matrix
+    from https://github.com/ActiveVisionLab/nerfmm/blob/main/utils/lie_group_helper.py#L47
+
+    Inputs:
+        v: (B, 3)
+    
+    Outputs:
+        R: (B, 3, 3)
+    """
+    zero = torch.zeros_like(v[:, :1]) # (B, 1)
+    skew_v0 = torch.cat([zero, -v[:, 2:3], v[:, 1:2]], 1) # (B, 3)
+    skew_v1 = torch.cat([v[:, 2:3], zero, -v[:, 0:1]], 1)
+    skew_v2 = torch.cat([-v[:, 1:2], v[:, 0:1], zero], 1)
+    skew_v = torch.stack([skew_v0, skew_v1, skew_v2], dim=1) # (B, 3, 3)
+
+    norm_v = rearrange(torch.norm(v, dim=1)+1e-7, 'b -> b 1 1')
+    eye = torch.eye(3, device=v.device)
+    R = eye + (torch.sin(norm_v)/norm_v)*skew_v + \
+        ((1-torch.cos(norm_v))/norm_v**2)*(skew_v@skew_v)
+    return R
 
 
 def normalize(v):

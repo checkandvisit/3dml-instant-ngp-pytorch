@@ -5,7 +5,7 @@ from einops import rearrange
 import vren
 
 MAX_SAMPLES = 1024
-NEAR_DISTANCE = 0.01
+NEAR_DISTANCE = 0.05
 
 
 def render(model, rays_o, rays_d, **kwargs):
@@ -106,7 +106,7 @@ def __render_rays_test(model, rays_o, rays_d, hits_t, **kwargs):
 
     if exp_step_factor==0: # synthetic
         rgb_bg = torch.ones(3, device=device)
-    else:
+    else: # real
         rgb_bg = torch.zeros(3, device=device)
     results['rgb'] += rgb_bg*rearrange(1-opacity, 'n -> n 1')
 
@@ -143,7 +143,7 @@ def __render_rays_train(model, rays_o, rays_d, hits_t, **kwargs):
 
     if exp_step_factor==0: # synthetic
         rgb_bg = torch.ones(3, device=rays_o.device)
-    else:
+    else: # real
         rgb_bg = torch.zeros(3, device=rays_o.device)
     results['rgb'] = results['rgb'] + \
                      rgb_bg*rearrange(1-results['opacity'], 'n -> n 1')

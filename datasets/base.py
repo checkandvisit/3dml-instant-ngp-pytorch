@@ -13,6 +13,9 @@ class BaseDataset(Dataset):
         self.downsample = downsample
         self.define_transforms()
 
+    def read_intrinsics(self):
+        raise NotImplementedError
+
     def define_transforms(self):
         self.transform = T.ToTensor()
 
@@ -33,7 +36,7 @@ class BaseDataset(Dataset):
                       'pix_idxs': pix_idxs}
         else:
             sample = {'pose': self.poses[idx],
-                      'idx': idx}
+                      'img_idxs': idx}
             if len(self.rays)>0: # if ground truth rgb available
                 sample['rgb'] = self.rays[idx]
 
